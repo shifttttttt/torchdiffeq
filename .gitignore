@@ -6,3 +6,8 @@
 .vscode
 build
 dist
+.idea/
+examples/png1
+examples/results
+examples/TripleNorm
+examples/Univarite

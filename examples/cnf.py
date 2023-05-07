@@ -4,13 +4,13 @@ import glob
 from PIL import Image
 import numpy as np
 import matplotlib
-matplotlib.use('agg')
+
+# matplotlib.use('agg')
 import matplotlib.pyplot as plt
 from sklearn.datasets import make_circles
 import torch
 import torch.nn as nn
 import torch.optim as optim
-
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--adjoint', action='store_true')
@@ -23,7 +23,8 @@ parser.add_argument('--hidden_dim', type=int, default=32)
 parser.add_argument('--gpu', type=int, default=0)
 parser.add_argument('--train_dir', type=str, default=None)
 parser.add_argument('--results_dir', type=str, default="./results")
-args = parser.parse_args()
+args = parser.parse_args('--results_dir=./Univarite --train_dir=./Univarite --niters=2000 --lr=1e-4 --viz'.split())
+# args = parser.parse_args()
 
 if args.adjoint:
     from torchdiffeq import odeint_adjoint as odeint
@@ -35,6 +36,7 @@ class CNF(nn.Module):
     """Adapted from the NumPy implementation at:
     https://gist.github.com/rtqichen/91924063aa4cc95e7ef30b3a5491cc52
     """
+
     def __init__(self, in_out_dim, hidden_dim, width):
         super().__init__()
         self.in_out_dim = in_out_dim
@@ -80,6 +82,7 @@ class HyperNetwork(nn.Module):
     Adapted from the NumPy implementation at:
     https://gist.github.com/rtqichen/91924063aa4cc95e7ef30b3a5491cc52
     """
+
     def __init__(self, in_out_dim, hidden_dim, width):
         super().__init__()
 
@@ -133,12 +136,19 @@ class RunningAverageMeter(object):
         self.val = val
 
 
+dir = r'D:\Python\torchdiffeq-master\examples\MultiTripleNorm.csv'
+dir = r'D:\Python\torchdiffeq-master\examples\TripleNorm.csv'
+data = np.loadtxt(dir).reshape([-1,1])
+in_out_dim = 1
+
 def get_batch(num_samples):
-    points, _ = make_circles(n_samples=num_samples, noise=0.06, factor=0.5)
+    # points, _ = make_circles(n_samples=num_samples, noise=0.06, factor=0.5)
+    rand_row = np.random.choice(np.arange(data.shape[0]),num_samples)
+    points = np.take(data, rand_row, axis=0)
     x = torch.tensor(points).type(torch.float32).to(device)
     logp_diff_t1 = torch.zeros(num_samples, 1).type(torch.float32).to(device)
 
-    return(x, logp_diff_t1)
+    return (x, logp_diff_t1)
 
 
 if __name__ == '__main__':
@@ -146,13 +156,17 @@ if __name__ == '__main__':
     t1 = 10
     device = torch.device('cuda:' + str(args.gpu)
                           if torch.cuda.is_available() else 'cpu')
-
+    device = 'cpu'
     # model
-    func = CNF(in_out_dim=2, hidden_dim=args.hidden_dim, width=args.width).to(device)
+    func = CNF(in_out_dim=in_out_dim, hidden_dim=args.hidden_dim, width=args.width).to(device)
     optimizer = optim.Adam(func.parameters(), lr=args.lr)
     p_z0 = torch.distributions.MultivariateNormal(
         loc=torch.tensor([0.0, 0.0]).to(device),
         covariance_matrix=torch.tensor([[0.1, 0.0], [0.0, 0.1]]).to(device)
+    )
+    p_z0 = torch.distributions.Normal(
+        loc=torch.tensor([0.0]).to(device),
+        scale=torch.tensor([1]).to(device)
     )
     loss_meter = RunningAverageMeter()
 
@@ -183,13 +197,18 @@ if __name__ == '__main__':
 
             z_t0, logp_diff_t0 = z_t[-1], logp_diff_t[-1]
 
-            logp_x = p_z0.log_prob(z_t0).to(device) - logp_diff_t0.view(-1)
+            logp_x = p_z0.log_prob(z_t0).to(device).view(-1) - logp_diff_t0.view(-1)
             loss = -logp_x.mean(0)
 
             loss.backward()
             optimizer.step()
-
             loss_meter.update(loss.item())
+            if itr% 10 ==0:
+                plt.close()
+                plot_data = torch.concatenate([x, torch.exp(logp_x).unsqueeze(1)], 1)
+                plot_data = plot_data.sort(0)[0].cpu().detach().numpy()
+                plt.plot(*plot_data.T)
+                plt.savefig("Univarite/{}.png".format(itr))
 
             print('Iter: {}, running avg loss: {:.4f}'.format(itr, loss_meter.avg))
 
@@ -202,85 +221,91 @@ if __name__ == '__main__':
             }, ckpt_path)
             print('Stored ckpt at {}'.format(ckpt_path))
     print('Training complete after {} iters.'.format(itr))
-
-    if args.viz:
-        viz_samples = 30000
-        viz_timesteps = 41
-        target_sample, _ = get_batch(viz_samples)
-
-        if not os.path.exists(args.results_dir):
-            os.makedirs(args.results_dir)
-        with torch.no_grad():
-            # Generate evolution of samples
-            z_t0 = p_z0.sample([viz_samples]).to(device)
-            logp_diff_t0 = torch.zeros(viz_samples, 1).type(torch.float32).to(device)
-
-            z_t_samples, _ = odeint(
-                func,
-                (z_t0, logp_diff_t0),
-                torch.tensor(np.linspace(t0, t1, viz_timesteps)).to(device),
-                atol=1e-5,
-                rtol=1e-5,
-                method='dopri5',
-            )
-
-            # Generate evolution of density
-            x = np.linspace(-1.5, 1.5, 100)
-            y = np.linspace(-1.5, 1.5, 100)
-            points = np.vstack(np.meshgrid(x, y)).reshape([2, -1]).T
-
-            z_t1 = torch.tensor(points).type(torch.float32).to(device)
-            logp_diff_t1 = torch.zeros(z_t1.shape[0], 1).type(torch.float32).to(device)
-
-            z_t_density, logp_diff_t = odeint(
-                func,
-                (z_t1, logp_diff_t1),
-                torch.tensor(np.linspace(t1, t0, viz_timesteps)).to(device),
-                atol=1e-5,
-                rtol=1e-5,
-                method='dopri5',
-            )
-
-            # Create plots for each timestep
-            for (t, z_sample, z_density, logp_diff) in zip(
-                    np.linspace(t0, t1, viz_timesteps),
-                    z_t_samples, z_t_density, logp_diff_t
-            ):
-                fig = plt.figure(figsize=(12, 4), dpi=200)
-                plt.tight_layout()
-                plt.axis('off')
-                plt.margins(0, 0)
-                fig.suptitle(f'{t:.2f}s')
-
-                ax1 = fig.add_subplot(1, 3, 1)
-                ax1.set_title('Target')
-                ax1.get_xaxis().set_ticks([])
-                ax1.get_yaxis().set_ticks([])
-                ax2 = fig.add_subplot(1, 3, 2)
-                ax2.set_title('Samples')
-                ax2.get_xaxis().set_ticks([])
-                ax2.get_yaxis().set_ticks([])
-                ax3 = fig.add_subplot(1, 3, 3)
-                ax3.set_title('Log Probability')
-                ax3.get_xaxis().set_ticks([])
-                ax3.get_yaxis().set_ticks([])
-
-                ax1.hist2d(*target_sample.detach().cpu().numpy().T, bins=300, density=True,
-                           range=[[-1.5, 1.5], [-1.5, 1.5]])
-
-                ax2.hist2d(*z_sample.detach().cpu().numpy().T, bins=300, density=True,
-                           range=[[-1.5, 1.5], [-1.5, 1.5]])
-
-                logp = p_z0.log_prob(z_density) - logp_diff.view(-1)
-                ax3.tricontourf(*z_t1.detach().cpu().numpy().T,
-                                np.exp(logp.detach().cpu().numpy()), 200)
-
-                plt.savefig(os.path.join(args.results_dir, f"cnf-viz-{int(t*1000):05d}.jpg"),
-                           pad_inches=0.2, bbox_inches='tight')
-                plt.close()
-
-            img, *imgs = [Image.open(f) for f in sorted(glob.glob(os.path.join(args.results_dir, f"cnf-viz-*.jpg")))]
-            img.save(fp=os.path.join(args.results_dir, "cnf-viz.gif"), format='GIF', append_images=imgs,
-                     save_all=True, duration=250, loop=0)
-
-        print('Saved visualization animation at {}'.format(os.path.join(args.results_dir, "cnf-viz.gif")))
+    if args.train_dir is not None:
+        ckpt_path = os.path.join(args.train_dir, 'ckpt.pth')
+        torch.save({
+            'func_state_dict': func.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+        }, ckpt_path)
+        print('Stored ckpt at {}'.format(ckpt_path))
+    # if args.viz:
+    #     viz_samples = 2048
+    #     viz_timesteps = 41
+    #     target_sample, _ = get_batch(viz_samples)
+    #
+    #     if not os.path.exists(args.results_dir):
+    #         os.makedirs(args.results_dir)
+    #     with torch.no_grad():
+    #         # Generate evolution of samples
+    #         z_t0 = p_z0.sample([viz_samples]).to(device)
+    #         logp_diff_t0 = torch.zeros(viz_samples, 1).type(torch.float32).to(device)
+    #
+    #         z_t_samples, _ = odeint(
+    #             func,
+    #             (z_t0, logp_diff_t0),
+    #             torch.tensor(np.linspace(t0, t1, viz_timesteps)).to(device),
+    #             atol=1e-5,
+    #             rtol=1e-5,
+    #             method='dopri5',
+    #         )
+    #
+    #         # Generate evolution of density
+    #         x = np.linspace(-10, 10, 200)
+    #         y = np.linspace(-10, 10, 200)
+    #         points = np.vstack(np.meshgrid(x, y)).reshape([2, -1]).T
+    #
+    #         z_t1 = torch.tensor(points).type(torch.float32).to(device)
+    #         logp_diff_t1 = torch.zeros(z_t1.shape[0], 1).type(torch.float32).to(device)
+    #
+    #         z_t_density, logp_diff_t = odeint(
+    #             func,
+    #             (z_t1, logp_diff_t1),
+    #             torch.tensor(np.linspace(t1, t0, viz_timesteps)).to(device),
+    #             atol=1e-5,
+    #             rtol=1e-5,
+    #             method='dopri5',
+    #         )
+    #
+    #         # Create plots for each timestep
+    #         for (t, z_sample, z_density, logp_diff) in zip(
+    #                 np.linspace(t0, t1, viz_timesteps),
+    #                 z_t_samples, z_t_density, logp_diff_t
+    #         ):
+    #             fig = plt.figure(figsize=(12, 4), dpi=200)
+    #             plt.tight_layout()
+    #             # plt.axis('off')
+    #             plt.margins(0, 0)
+    #             fig.suptitle(f'{t:.2f}s')
+    #
+    #             ax1 = fig.add_subplot(1, 3, 1)
+    #             ax1.set_title('Target')
+    #             ax1.get_xaxis().set_ticks([])
+    #             ax1.get_yaxis().set_ticks([])
+    #             ax2 = fig.add_subplot(1, 3, 2)
+    #             ax2.set_title('Samples')
+    #             ax2.get_xaxis().set_ticks([])
+    #             ax2.get_yaxis().set_ticks([])
+    #             ax3 = fig.add_subplot(1, 3, 3)
+    #             ax3.set_title('Log Probability')
+    #             ax3.get_xaxis().set_ticks([])
+    #             ax3.get_yaxis().set_ticks([])
+    #
+    #             ax1.hist2d(*target_sample.detach().cpu().numpy().T,bins=50, density=True)
+    #                        # ,range=[[-1.5, 1.5], [-1.5, 1.5]])
+    #
+    #             ax2.hist2d(*z_sample.detach().cpu().numpy().T, bins=50, density=True)
+    #                        # ,range=[[-1.5, 1.5], [-1.5, 1.5]])
+    #
+    #             logp = p_z0.log_prob(z_density) - logp_diff.view(-1)
+    #             ax3.tricontourf(*z_t1.detach().cpu().numpy().T,
+    #                             np.exp(logp.detach().cpu().numpy()), 200)
+    #
+    #             plt.savefig(os.path.join(args.results_dir, f"cnf-viz-{int(t * 1000):05d}.jpg"),
+    #                         pad_inches=0.2, bbox_inches='tight')
+    #             plt.close()
+    #
+    #         img, *imgs = [Image.open(f) for f in sorted(glob.glob(os.path.join(args.results_dir, f"cnf-viz-*.jpg")))]
+    #         img.save(fp=os.path.join(args.results_dir, "cnf-viz.gif"), format='GIF', append_images=imgs,
+    #                  save_all=True, duration=250, loop=0)
+    #
+    #     print('Saved visualization animation at {}'.format(os.path.join(args.results_dir, "cnf-viz.gif")))
